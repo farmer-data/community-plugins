@@ -48,7 +48,9 @@ test("checker source has no network, process-spawning, or write APIs", () => {
   ]) {
     assert.doesNotMatch(source, forbidden);
   }
-  assert.match(source, /fs\.openSync\(filePath, "r"\)/, "files are opened read-only");
+  assert.match(source, /fs\.openSync\(filePath, READ_FLAGS\)/, "files are opened through READ_FLAGS");
+  assert.match(source, /const READ_FLAGS = fs\.constants\.O_RDONLY \| \(fs\.constants\.O_NOFOLLOW \?\? 0\) \| \(fs\.constants\.O_NONBLOCK \?\? 0\);/, "reads are read-only, no-follow, and non-blocking");
+  assert.match(source, /fs\.fstatSync\(fd\)\.isFile\(\)/, "only regular files are read");
 });
 
 test("credential-shaped values are reported but redacted in every output format", () => {
@@ -75,6 +77,8 @@ test("symlinked directories and files are never followed", (t) => {
         fs.mkdirSync(path.join(tmp, "sub"));
         fs.symlinkSync(path.join(outside, "AGENTS.md"), path.join(tmp, "sub", "AGENTS.md"));
       } catch (error) {
+        // Only Windows hosts without symlink privileges may skip.
+        if (process.platform !== "win32") throw error;
         t.skip("symlinks unavailable on this host: " + error.code);
         return;
       }

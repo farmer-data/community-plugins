@@ -99,8 +99,28 @@ plugin has no app, MCP server, account, or credential.
 - Output uses root-relative paths, so reports do not leak absolute home
   directories.
 - Credential-shaped values are redacted in all output.
-- Each file is read up to 1 MiB, and discovery stops at 200 instruction files
-  (`--max-files`).
+- Every file is opened read-only and without following symlinks, and only
+  regular files are read (FIFOs and devices are skipped). Each file is read up
+  to 1 MiB; content past that is ignored, and the size is still reported.
+- References are checked by listing only the directories along each
+  referenced path inside the root. Referenced files are never opened.
+
+## Discovery limits
+
+Discovery is a single bounded walk. It stops as soon as any limit is reached
+and reports a `discovery-limit` warning naming the limit:
+
+| Limit | Default | Override |
+| --- | --- | --- |
+| Instruction files collected | 200 | `--max-files N` |
+| Directories listed | 10,000 | `--max-dirs N` |
+| Directory depth below the root | 32 | none; set `--root` deeper |
+| Directory entries examined | 200,000 | none; narrow `--root` |
+
+Generated directories (`node_modules`, `.git`, `dist`, `build`, virtual
+environments, and similar) and symlinks are never entered and do not count
+toward the directory limit. JSON reports include a `discovery` object with the
+directories listed, entries examined, and the limit reached (`null` if none).
 
 ## Failure behavior
 

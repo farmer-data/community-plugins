@@ -12,7 +12,12 @@ import { fileURLToPath } from "node:url";
 export const TOOL_VERSION = "0.1.0";
 export const DEFAULT_MAX_BYTES = 32 * 1024;
 export const DEFAULT_MAX_FILES = 200;
+export const DEFAULT_MAX_DIRECTORIES = 10_000;
+export const DEFAULT_MAX_DEPTH = 32;
+export const DEFAULT_MAX_ENTRIES = 200_000;
 const MAX_READ_BYTES = 1024 * 1024;
+// Read-only, never through a symlink, and never blocking on a FIFO or device.
+const READ_FLAGS = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
 
 export const INSTRUCTION_FILES = ["AGENTS.md", "AGENTS.override.md"];
 
@@ -87,7 +92,7 @@ export const RULES = {
   },
   "discovery-limit": {
     severity: "warning",
-    summary: "Discovery stopped at the file limit; some instruction files were not audited.",
+    summary: "Discovery stopped at a file, directory, depth, or entry limit; some instruction files may not have been audited.",
   },
 };
 
@@ -263,8 +268,9 @@ function isDirectory(target) {
 }
 
 function readTextLimited(filePath) {
-  const fd = fs.openSync(filePath, "r");
+  const fd = fs.openSync(filePath, READ_FLAGS);
   try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error("not a regular file");
     const buffer = Buffer.alloc(MAX_READ_BYTES);
     const bytesRead = fs.readSync(fd, buffer, 0, MAX_READ_BYTES, 0);
     return buffer.subarray(0, bytesRead).toString("utf8");
@@ -273,18 +279,48 @@ function readTextLimited(filePath) {
   }
 }
 
-export function discoverInstructionFiles(rootDir, maxFiles = DEFAULT_MAX_FILES) {
+// Discovery is bounded four ways: instruction files collected, directories
+// listed, directory depth, and directory entries examined. The walk stops as
+// soon as any limit is reached and reports which one.
+export function discoverInstructionFiles(rootDir, limits = {}) {
+  const maxFiles = limits.maxFiles ?? DEFAULT_MAX_FILES;
+  const maxDirectories = limits.maxDirectories ?? DEFAULT_MAX_DIRECTORIES;
+  const maxDepth = limits.maxDepth ?? DEFAULT_MAX_DEPTH;
+  const maxEntries = limits.maxEntries ?? DEFAULT_MAX_ENTRIES;
   const found = [];
-  let truncated = false;
-  const stack = [rootDir];
+  let directories = 0;
+  let entriesSeen = 0;
+  let limit = null;
+  const stack = [{ directory: rootDir, depth: 0 }];
 
-  while (stack.length > 0) {
-    const directory = stack.pop();
-    let entries;
+  walk: while (stack.length > 0) {
+    if (directories >= maxDirectories) {
+      limit = "directories";
+      break;
+    }
+    const { directory, depth } = stack.pop();
+    directories += 1;
+    const entries = [];
+    let handle;
     try {
-      entries = fs.readdirSync(directory, { withFileTypes: true });
+      handle = fs.opendirSync(directory);
     } catch {
       continue;
+    }
+    try {
+      let entry;
+      while ((entry = handle.readSync()) !== null) {
+        if (entriesSeen >= maxEntries) {
+          limit = "entries";
+          break;
+        }
+        entriesSeen += 1;
+        entries.push(entry);
+      }
+    } catch {
+      // An unreadable directory contributes the entries read so far.
+    } finally {
+      handle.closeSync();
     }
     entries.sort((a, b) => a.name.localeCompare(b.name));
     const childDirectories = [];
@@ -297,26 +333,31 @@ export function discoverInstructionFiles(rootDir, maxFiles = DEFAULT_MAX_FILES) 
       }
       if (entry.isDirectory()) {
         if (!SKIPPED_DIRECTORIES.has(entry.name)) {
-          childDirectories.push(entryPath);
+          if (depth + 1 > maxDepth) {
+            limit ??= "depth";
+          } else {
+            childDirectories.push(entryPath);
+          }
         }
         continue;
       }
       if (entry.isFile() && INSTRUCTION_FILES.includes(entry.name)) {
         if (found.length >= maxFiles) {
-          truncated = true;
-          continue;
+          limit = "files";
+          break walk;
         }
         found.push(entryPath);
       }
     }
+    if (limit === "entries") break;
 
     for (const child of childDirectories.reverse()) {
-      stack.push(child);
+      stack.push({ directory: child, depth: depth + 1 });
     }
   }
 
   found.sort((a, b) => toPosix(path.relative(rootDir, a)).localeCompare(toPosix(path.relative(rootDir, b))));
-  return { files: found, truncated };
+  return { files: found, limit, truncated: limit !== null, directories, entries: entriesSeen };
 }
 
 export function scanMarkdown(text) {
@@ -547,7 +588,8 @@ function checkCommands(candidate, fileDir, context, report) {
   for (const segment of splitCommandSegments(candidate.text)) {
     const cd = segment.match(/^cd\s+(\S+)$/u);
     if (cd) {
-      const target = path.resolve(baseDir, cleanToken(cd[1]));
+      // Strip quotes only: cleanToken's trailing-dot trim would turn `cd ..` into a no-op.
+      const target = path.resolve(baseDir, cd[1].replace(/^["']|["']$/gu, ""));
       if (!isInside(rootDir, target) || !isDirectory(target)) return;
       baseDir = target;
       continue;
@@ -680,6 +722,7 @@ function checkFile(filePath, text, context, report) {
 export function auditRepository(rootInput, options = {}) {
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
   const maxFiles = options.maxFiles ?? DEFAULT_MAX_FILES;
+  const maxDirectories = options.maxDirectories ?? DEFAULT_MAX_DIRECTORIES;
   listingCache.clear();
   const rootDir = fs.realpathSync(path.resolve(rootInput));
   if (!fs.statSync(rootDir).isDirectory()) {
@@ -688,7 +731,8 @@ export function auditRepository(rootInput, options = {}) {
   listingRoot = rootDir;
 
   const findings = [];
-  const { files, truncated } = discoverInstructionFiles(rootDir, maxFiles);
+  const discovery = discoverInstructionFiles(rootDir, { maxFiles, maxDirectories });
+  const { files } = discovery;
   const cache = { packages: new Map(), makefiles: new Map() };
   const context = new Context(rootDir, cache);
   const fileRecords = [];
@@ -813,13 +857,19 @@ export function auditRepository(rootInput, options = {}) {
       message: "No AGENTS.md at the repository root; shared project instructions have no home.",
     });
   }
-  if (truncated) {
+  if (discovery.limit) {
+    const reasons = {
+      files: "after " + maxFiles + " instruction files; rerun with a narrower --root or a larger --max-files.",
+      directories: "after listing " + maxDirectories + " directories; rerun with a narrower --root or a larger --max-dirs.",
+      depth: "at directories nested more than " + DEFAULT_MAX_DEPTH + " levels deep; rerun with --root set to a deeper directory.",
+      entries: "after examining " + DEFAULT_MAX_ENTRIES + " directory entries; rerun with a narrower --root.",
+    };
     findings.push({
       id: "discovery-limit",
       severity: RULES["discovery-limit"].severity,
       file: ".",
       line: 0,
-      message: "Stopped after " + maxFiles + " instruction files; rerun with a narrower --root or a larger --max-files.",
+      message: "Discovery stopped " + reasons[discovery.limit],
     });
   }
 
@@ -842,6 +892,7 @@ export function auditRepository(rootInput, options = {}) {
     writesPerformed: false,
     root: ".",
     maxBytes,
+    discovery: { directories: discovery.directories, entries: discovery.entries, limit: discovery.limit },
     files: fileRecords.map((record) => ({
       path: record.path,
       bytes: record.bytes,
@@ -880,7 +931,8 @@ export function formatText(result) {
 
 const USAGE = `Usage:
   agents-md-audit.mjs audit [--root DIR] [--format text|json] [--max-bytes N]
-                            [--max-files N] [--fail-on error|warning|info|never]
+                            [--max-files N] [--max-dirs N]
+                            [--fail-on error|warning|info|never]
   agents-md-audit.mjs rules [--format text|json]
 
 Read-only. Exit codes: 0 = nothing at or above --fail-on (default error),
@@ -889,7 +941,7 @@ Read-only. Exit codes: 0 = nothing at or above --fail-on (default error),
 
 function parseArgs(argv) {
   const [command, ...rest] = argv;
-  const options = { command, root: ".", format: "text", maxBytes: DEFAULT_MAX_BYTES, maxFiles: DEFAULT_MAX_FILES, failOn: "error" };
+  const options = { command, root: ".", format: "text", maxBytes: DEFAULT_MAX_BYTES, maxFiles: DEFAULT_MAX_FILES, maxDirectories: DEFAULT_MAX_DIRECTORIES, failOn: "error" };
   for (let index = 0; index < rest.length; index += 1) {
     const flag = rest[index];
     const value = rest[index + 1];
@@ -913,6 +965,10 @@ function parseArgs(argv) {
       case "--max-files":
         options.maxFiles = Number(needValue());
         if (!Number.isInteger(options.maxFiles) || options.maxFiles <= 0) throw new Error("--max-files must be a positive integer");
+        break;
+      case "--max-dirs":
+        options.maxDirectories = Number(needValue());
+        if (!Number.isInteger(options.maxDirectories) || options.maxDirectories <= 0) throw new Error("--max-dirs must be a positive integer");
         break;
       case "--fail-on":
         options.failOn = needValue();
@@ -961,7 +1017,7 @@ export function main(argv = process.argv.slice(2), io = { stdout: process.stdout
 
   let result;
   try {
-    result = auditRepository(options.root, { maxBytes: options.maxBytes, maxFiles: options.maxFiles });
+    result = auditRepository(options.root, { maxBytes: options.maxBytes, maxFiles: options.maxFiles, maxDirectories: options.maxDirectories });
   } catch (error) {
     const reason = error && error.code === "ENOENT" ? "root does not exist" : error.message;
     io.stderr.write("error: cannot audit root: " + reason + "\n");

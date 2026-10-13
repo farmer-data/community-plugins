@@ -152,3 +152,16 @@ test("generated directories are skipped during discovery", () => {
     },
   );
 });
+
+test("cd .. moves to the parent directory instead of being ignored", () => {
+  withTempRepo(
+    {
+      "Makefile": "all:\n\techo\n",
+      "sub/AGENTS.md": "- `cd .. && make all`\n- `cd .. && make missing`\n",
+    },
+    (tmp) => {
+      const { report } = auditJson(tmp, ["--fail-on", "never"]);
+      assert.deepEqual(ids(report), ["missing-root@.:0", "unknown-make-target@sub/AGENTS.md:2"]);
+    },
+  );
+});

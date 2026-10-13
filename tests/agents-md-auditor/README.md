@@ -25,9 +25,14 @@ Tests are grouped by execution boundary:
 - `security/` checks the distribution for symlinks, caches, personal paths, and
   secret-shaped values; confirms the checker source has no network, spawn, or
   write APIs; and verifies redaction, symlink non-following, outside-root
-  containment, and that reports contain no absolute paths.
+  containment, and that reports contain no absolute paths. `limits.test.mjs`
+  checks that discovery stops at each of its limits (files, directories, depth,
+  entries), the 1 MiB read cap for instruction files, `package.json`, and
+  Makefiles, that symlinked and FIFO inputs are skipped without blocking, and
+  that `cd` targets outside the root are not followed.
 
 Credential-shaped and oversize inputs are generated in temporary directories at
-test time, so no such values are committed. The symlink test is skipped, and
-reported as skipped, on hosts where symlinks cannot be created; a skip is not a
-pass.
+test time, so no such values are committed. Symlink tests may be skipped, and
+are reported as skipped, only on Windows hosts that cannot create symlinks; on
+other hosts a symlink failure fails the test. The FIFO test is skipped on
+Windows. A skip is not a pass.

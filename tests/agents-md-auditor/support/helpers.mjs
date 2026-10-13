@@ -14,6 +14,7 @@ export function runCli(args, options = {}) {
   const result = spawnSync(process.execPath, [options.cli ?? cli, ...args], {
     cwd: options.cwd ?? repoRoot,
     encoding: "utf8",
+    timeout: options.timeout,
   });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
